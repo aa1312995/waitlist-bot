@@ -29,6 +29,11 @@ log = logging.getLogger(__name__)
 # Username: 5-32 chars, alphanumeric + underscore, optional leading @
 USERNAME_RE = re.compile(r"^@?([a-zA-Z][a-zA-Z0-9_]{4,31})$")
 
+# Forbidden usernames (admin can use any, including "admin")
+FORBIDDEN_USERNAMES = frozenset(
+    {"admin", "owner", "operator", "courier", "kurir", "vendor", "dealer", "diler"}
+)
+
 
 def telegram_html_escape(s: str) -> str:
     """Escape string for Telegram HTML."""
@@ -36,15 +41,14 @@ def telegram_html_escape(s: str) -> str:
 
 
 def normalize_username(raw: str) -> str | None:
-    """Normalize username: ensure @ prefix, validate, return lowercase for storage."""
+    """Normalize username: validate, return lowercase for storage (no @ prefix)."""
     raw = raw.strip()
     if not raw:
         return None
     m = USERNAME_RE.match(raw)
     if not m:
         return None
-    name = m.group(1)
-    return f"@{name.lower()}"
+    return m.group(1).lower()
 
 
 def generate_password(length: int = 12) -> str:
@@ -252,6 +256,11 @@ def main():
                     username_norm = normalize_username(text)
                     if not username_norm:
                         bot.send_message(chat_id, strings.msg_username_invalid)
+                        continue
+
+                    # Forbidden usernames (admin can use any)
+                    if not is_admin and username_norm in FORBIDDEN_USERNAMES:
+                        bot.send_message(chat_id, strings.msg_username_forbidden)
                         continue
 
                     existing = (
