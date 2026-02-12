@@ -1,1 +1,13 @@
+# Waitlist Registration Bot Configuration
+
+[Telegram]
+# Your bot token - Get one from https://t.me/BotFather!
+token = "8289947463:AAFDEqAOCW0-TdnN1Pzxv7VjR5FhJ33Qqes"
+
+# Time to wait before sending another update request if there are no messages
+long_polling_timeout = 30
+
+[Database]
+# SQLite database for waitlist entries
+engine = "sqlite:///waitlist.db"
 
