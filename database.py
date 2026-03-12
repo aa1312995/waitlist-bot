@@ -35,6 +35,18 @@ class Admin(Base):
         return f"<Admin {self.user_id}>"
 
 
+class BotConfig(Base):
+    """Key-value config storage (e.g. platform links)."""
+
+    __tablename__ = "bot_config"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(String(2048), nullable=True)
+
+    def __repr__(self):
+        return f"<BotConfig {self.key}=...>"
+
+
 def init_db(engine_url: str):
     """Initialize database engine, create tables, and return Session factory."""
     engine = create_engine(engine_url, connect_args={"timeout": 30} if "sqlite" in engine_url else {})

@@ -19,7 +19,9 @@ import telegram
 import telegram.error
 import toml
 
-from database import Admin, WaitlistEntry, init_db
+from sqlalchemy import and_, or_
+
+from database import Admin, BotConfig, WaitlistEntry, init_db
 
 # Import strings
 from strings import en as strings
@@ -32,6 +34,12 @@ USERNAME_RE = re.compile(r"^@?([a-zA-Z][a-zA-Z0-9_]{4,31})$")
 # Forbidden usernames (admin can use any, including "admin")
 FORBIDDEN_USERNAMES = frozenset(
     {"admin", "owner", "operator", "courier", "kurir", "vendor", "dealer", "diler"}
+)
+
+# Link validation: http://, https://, or .onion
+LINK_RE = re.compile(
+    r"^(https?://[^\s,]+|[a-zA-Z0-9\-]+\.onion[a-zA-Z0-9/]*)$",
+    re.IGNORECASE,
 )
 
 
@@ -55,6 +63,62 @@ def generate_password(length: int = 12) -> str:
     """Generate a secure random password with letters, digits, special chars."""
     chars = string.ascii_letters + string.digits + "!@#$%^&*"
     return "".join(secrets.choice(chars) for _ in range(length))
+
+
+def get_platform_links(session) -> list[str]:
+    """Get stored platform links from config."""
+    row = session.query(BotConfig).filter_by(key="platform_links").first()
+    if not row or not row.value:
+        return []
+    return [s.strip() for s in row.value.split(",") if s.strip()]
+
+
+def validate_and_parse_links(raw: str) -> list[str] | None:
+    """Validate comma-separated links; return list or None if invalid."""
+    parts = [s.strip() for s in raw.split(",") if s.strip()]
+    if not parts:
+        return None
+    for p in parts:
+        if not LINK_RE.match(p):
+            return None
+    return parts
+
+
+def get_user_position(session, entry: WaitlistEntry) -> int:
+    """Get 1-based position by created_at order (oldest first)."""
+    count = (
+        session.query(WaitlistEntry)
+        .filter(
+            or_(
+                WaitlistEntry.created_at < entry.created_at,
+                and_(
+                    WaitlistEntry.created_at == entry.created_at,
+                    WaitlistEntry.id < entry.id,
+                ),
+            )
+        )
+        .count()
+    )
+    return count + 1
+
+
+def get_bonus_display(position: int) -> str:
+    """Get bonus text: positions 1-3 show N/A, 4+ show EUR amount."""
+    if position <= 3:
+        return strings.msg_bonus_na
+    eff = position - 3
+    if eff <= 50:
+        return "12 EUR"
+    if eff <= 100:
+        return "5 EUR"
+    return "1 EUR"
+
+
+def get_place_display(position: int, is_admin: bool) -> str:
+    """Get place text: #1/#2... for position 4+, Admin/Test for 1-3."""
+    if position <= 3:
+        return strings.msg_place_admin if is_admin else strings.msg_place_test
+    return f"#{position - 3}"
 
 
 def catch_telegram_errors(func):
@@ -150,17 +214,28 @@ def main():
 
     log.info(f"@{me.username} starting (waitlist bot)")
 
-    # In-memory state: chat_id -> "awaiting_username" or None
+    # In-memory state: chat_id -> "awaiting_username" | "awaiting_links" | "awaiting_delete_username" | None
     user_states = {}
     next_update = None
 
     user_keyboard = telegram.ReplyKeyboardMarkup(
-        [[telegram.KeyboardButton(strings.msg_coming_soon_btn)]],
+        [[telegram.KeyboardButton(strings.msg_link_btn)]],
+        one_time_keyboard=False,
+    )
+
+    admin_user_keyboard = telegram.ReplyKeyboardMarkup(
+        [
+            [telegram.KeyboardButton(strings.msg_link_btn), telegram.KeyboardButton(strings.msg_switch_to_admin)],
+        ],
         one_time_keyboard=False,
     )
 
     admin_keyboard = telegram.ReplyKeyboardMarkup(
-        [[telegram.KeyboardButton(strings.msg_admin_download)]],
+        [
+            [telegram.KeyboardButton(strings.msg_admin_download), telegram.KeyboardButton(strings.msg_admin_set_link)],
+            [telegram.KeyboardButton(strings.msg_admin_delete)],
+            [telegram.KeyboardButton(strings.msg_switch_to_user)],
+        ],
         one_time_keyboard=False,
     )
 
@@ -208,7 +283,9 @@ def main():
                         session.add(Admin(user_id=from_user.id))
                         session.commit()
                         is_admin = True
+                        user_states[chat_id] = "awaiting_username"
                         bot.send_message(chat_id, strings.msg_first_admin)
+                        continue
 
                     if is_admin and entry:
                         bot.send_message(
@@ -226,13 +303,183 @@ def main():
                         )
                         continue
 
-                    user_states[chat_id] = "awaiting_username"
-                    bot.send_message(chat_id, strings.msg_ask_username)
+                    # Registrations closed: block new unregistered users
+                    bot.send_message(chat_id, strings.msg_registrations_closed)
                     continue
 
-                # User: Coming soon button
-                if entry and text == strings.msg_coming_soon_btn:
-                    bot.send_message(chat_id, strings.msg_coming_soon_response)
+                # User: Link button
+                if entry and text == strings.msg_link_btn:
+                    links = get_platform_links(session)
+                    position = get_user_position(session, entry)
+                    place_str = get_place_display(position, is_admin)
+                    bonus_str = get_bonus_display(position)
+                    date_str = entry.created_at.strftime("%d.%m.%Y %H:%M:%S")
+
+                    lines = [
+                        strings.msg_link_header,
+                        "",
+                        f"{strings.msg_link_username}",
+                        f"<code>{telegram_html_escape(entry.wanted_username)}</code>",
+                        "",
+                        f"{strings.msg_link_password}",
+                        f"<code>{telegram_html_escape(entry.password)}</code>",
+                        "",
+                    ]
+                    if links:
+                        label = strings.msg_link_links if len(links) > 1 else strings.msg_link_single
+                        lines.append(label)
+                        for link in links:
+                            lines.append(f"<code>{telegram_html_escape(link)}</code>")
+                        lines.append("")
+                    else:
+                        lines.append(strings.msg_link_no_links)
+                        lines.append("")
+
+                    lines.extend([
+                        f"{strings.msg_link_place} {place_str}",
+                        f"{strings.msg_link_registered} {date_str}",
+                        f"{strings.msg_link_bonus} {bonus_str}",
+                        "",
+                        strings.msg_link_password_note,
+                    ])
+                    bot.send_message(chat_id, "\n".join(lines))
+                    continue
+
+                # Admin: Switch to User menu
+                if is_admin and text == strings.msg_switch_to_user:
+                    bot.send_message(
+                        chat_id,
+                        strings.msg_welcome_back,
+                        reply_markup=admin_user_keyboard,
+                    )
+                    continue
+
+                # Admin: Switch to Admin menu
+                if is_admin and text == strings.msg_switch_to_admin:
+                    bot.send_message(
+                        chat_id,
+                        strings.msg_admin_menu,
+                        reply_markup=admin_keyboard,
+                    )
+                    continue
+
+                # Admin: Set Link
+                if is_admin and text == strings.msg_admin_set_link:
+                    links = get_platform_links(session)
+                    skip_keyboard = telegram.ReplyKeyboardMarkup(
+                        [[telegram.KeyboardButton(strings.msg_set_link_skip)]],
+                        one_time_keyboard=True,
+                    )
+                    if links:
+                        links_text = "\n".join(f"<code>{telegram_html_escape(l)}</code>" for l in links)
+                        bot.send_message(
+                            chat_id,
+                            strings.msg_set_link_current.format(links=links_text),
+                            reply_markup=skip_keyboard,
+                        )
+                    else:
+                        bot.send_message(
+                            chat_id,
+                            strings.msg_set_link_prompt,
+                            reply_markup=skip_keyboard,
+                        )
+                    user_states[chat_id] = "awaiting_links"
+                    continue
+
+                # Admin: Delete by username
+                if is_admin and text == strings.msg_admin_delete:
+                    cancel_keyboard = telegram.ReplyKeyboardMarkup(
+                        [[telegram.KeyboardButton(strings.msg_delete_cancel)]],
+                        one_time_keyboard=True,
+                    )
+                    bot.send_message(
+                        chat_id,
+                        strings.msg_delete_prompt,
+                        reply_markup=cancel_keyboard,
+                    )
+                    user_states[chat_id] = "awaiting_delete_username"
+                    continue
+
+                # Admin: awaiting_delete_username
+                if is_admin and user_states.get(chat_id) == "awaiting_delete_username":
+                    if text == strings.msg_delete_cancel:
+                        user_states.pop(chat_id, None)
+                        bot.send_message(
+                            chat_id,
+                            strings.msg_admin_menu,
+                            reply_markup=admin_keyboard,
+                        )
+                        continue
+                    if text == strings.msg_admin_download:
+                        user_states.pop(chat_id, None)
+                        entries = (
+                            session.query(WaitlistEntry)
+                            .order_by(WaitlistEntry.created_at.asc())
+                            .all()
+                        )
+                        lines = [f"{i}. {e.wanted_username} {e.password}" for i, e in enumerate(entries, 1)]
+                        buf = BytesIO("\n".join(lines).encode("utf-8"))
+                        buf.name = "users.txt"
+                        bot.send_document(chat_id, buf, filename="users.txt", caption=strings.msg_file_caption)
+                        bot.send_message(chat_id, strings.msg_admin_menu, reply_markup=admin_keyboard)
+                        continue
+                    username_norm = normalize_username(text)
+                    if not username_norm:
+                        bot.send_message(chat_id, strings.msg_username_invalid)
+                        continue
+                    target = session.query(WaitlistEntry).filter_by(wanted_username=username_norm).first()
+                    if not target:
+                        bot.send_message(chat_id, strings.msg_delete_not_found)
+                        continue
+                    session.delete(target)
+                    session.commit()
+                    user_states.pop(chat_id, None)
+                    bot.send_message(
+                        chat_id,
+                        strings.msg_delete_success,
+                        reply_markup=admin_keyboard,
+                    )
+                    continue
+
+                # Admin: awaiting_links (Set Link flow)
+                if is_admin and user_states.get(chat_id) == "awaiting_links":
+                    if text == strings.msg_set_link_skip:
+                        user_states.pop(chat_id, None)
+                        bot.send_message(
+                            chat_id,
+                            strings.msg_admin_menu,
+                            reply_markup=admin_keyboard,
+                        )
+                        continue
+                    if text == strings.msg_admin_download:
+                        user_states.pop(chat_id, None)
+                        entries = (
+                            session.query(WaitlistEntry)
+                            .order_by(WaitlistEntry.created_at.asc())
+                            .all()
+                        )
+                        lines = [f"{i}. {e.wanted_username} {e.password}" for i, e in enumerate(entries, 1)]
+                        buf = BytesIO("\n".join(lines).encode("utf-8"))
+                        buf.name = "users.txt"
+                        bot.send_document(chat_id, buf, filename="users.txt", caption=strings.msg_file_caption)
+                        bot.send_message(chat_id, strings.msg_admin_menu, reply_markup=admin_keyboard)
+                        continue
+                    parsed = validate_and_parse_links(text)
+                    if parsed is None:
+                        bot.send_message(chat_id, strings.msg_set_link_invalid)
+                        continue
+                    row = session.query(BotConfig).filter_by(key="platform_links").first()
+                    if row:
+                        row.value = ",".join(parsed)
+                    else:
+                        session.add(BotConfig(key="platform_links", value=",".join(parsed)))
+                    session.commit()
+                    user_states.pop(chat_id, None)
+                    bot.send_message(
+                        chat_id,
+                        strings.msg_set_link_saved,
+                        reply_markup=admin_keyboard,
+                    )
                     continue
 
                 # Admin: Download users .txt file
@@ -281,10 +528,11 @@ def main():
                     session.commit()
                     user_states.pop(chat_id, None)
 
+                    markup = admin_keyboard if is_admin else user_keyboard
                     bot.send_message(
                         chat_id,
                         strings.msg_registered,
-                        reply_markup=user_keyboard,
+                        reply_markup=markup,
                     )
 
             finally:
