@@ -11,6 +11,7 @@ import re
 import secrets
 import string
 import sys
+import threading
 import time
 import traceback
 from io import BytesIO
@@ -121,6 +122,75 @@ def get_place_display(position: int, is_admin: bool) -> str:
     return f"#{position - 3}"
 
 
+def build_platform_access_message(session, entry: WaitlistEntry, links: list[str]) -> str:
+    """Build the platform access message for a given entry (same as Link button)."""
+    is_admin = session.query(Admin).filter_by(user_id=entry.user_id).first() is not None
+    position = get_user_position(session, entry)
+    place_str = get_place_display(position, is_admin)
+    bonus_str = get_bonus_display(position)
+    date_str = entry.created_at.strftime("%d.%m.%Y %H:%M:%S")
+
+    lines = [
+        strings.msg_link_header,
+        "",
+        f"{strings.msg_link_username}",
+        f"<code>{telegram_html_escape(entry.wanted_username)}</code>",
+        "",
+        f"{strings.msg_link_password}",
+        f"<code>{telegram_html_escape(entry.password)}</code>",
+        "",
+    ]
+    if links:
+        label = strings.msg_link_links if len(links) > 1 else strings.msg_link_single
+        lines.append(label)
+        for link in links:
+            lines.append(f"<code>{telegram_html_escape(link)}</code>")
+        lines.append("")
+    else:
+        lines.append(strings.msg_link_no_links)
+        lines.append("")
+
+    lines.extend([
+        f"{strings.msg_link_place} {place_str}",
+        f"{strings.msg_link_registered} {date_str}",
+        f"{strings.msg_link_bonus} {bonus_str}",
+        "",
+        strings.msg_link_password_note,
+    ])
+    return "\n".join(lines)
+
+
+def do_broadcast(bot_instance: "WaitlistBot", Session, admin_user_ids: list[int]) -> tuple[int, int]:
+    """Send platform access message to all registered users. Returns (sent, failed)."""
+    session = Session()
+    try:
+        entries = (
+            session.query(WaitlistEntry)
+            .order_by(WaitlistEntry.created_at.asc())
+            .all()
+        )
+        links = get_platform_links(session)
+
+        sent = 0
+        failed = 0
+        for entry in entries:
+            text = build_platform_access_message(session, entry, links)
+            result = bot_instance.send_message(entry.user_id, text)
+            if result is not None:
+                sent += 1
+            else:
+                failed += 1
+            time.sleep(0.1)
+
+        complete_msg = strings.msg_broadcast_complete.format(sent=sent, failed=failed)
+        for admin_id in admin_user_ids:
+            bot_instance.send_message(admin_id, complete_msg)
+
+        return (sent, failed)
+    finally:
+        session.close()
+
+
 def catch_telegram_errors(func):
     """Decorator to retry on Telegram API errors."""
 
@@ -214,7 +284,7 @@ def main():
 
     log.info(f"@{me.username} starting (waitlist bot)")
 
-    # In-memory state: chat_id -> "awaiting_username" | "awaiting_links" | "awaiting_delete_username" | None
+    # In-memory state: chat_id -> "awaiting_username" | "awaiting_links" | "awaiting_delete_username" | "awaiting_broadcast_minutes" | None
     user_states = {}
     next_update = None
 
@@ -234,10 +304,13 @@ def main():
         [
             [telegram.KeyboardButton(strings.msg_admin_download), telegram.KeyboardButton(strings.msg_admin_set_link)],
             [telegram.KeyboardButton(strings.msg_admin_delete)],
+            [telegram.KeyboardButton(strings.msg_admin_broadcast), telegram.KeyboardButton(strings.msg_admin_stop_broadcast)],
             [telegram.KeyboardButton(strings.msg_switch_to_user)],
         ],
         one_time_keyboard=False,
     )
+
+    broadcast_state = {"active": False, "stop_requested": False}
 
     while True:
         try:
@@ -310,39 +383,8 @@ def main():
                 # User: Link button
                 if entry and text == strings.msg_link_btn:
                     links = get_platform_links(session)
-                    position = get_user_position(session, entry)
-                    place_str = get_place_display(position, is_admin)
-                    bonus_str = get_bonus_display(position)
-                    date_str = entry.created_at.strftime("%d.%m.%Y %H:%M:%S")
-
-                    lines = [
-                        strings.msg_link_header,
-                        "",
-                        f"{strings.msg_link_username}",
-                        f"<code>{telegram_html_escape(entry.wanted_username)}</code>",
-                        "",
-                        f"{strings.msg_link_password}",
-                        f"<code>{telegram_html_escape(entry.password)}</code>",
-                        "",
-                    ]
-                    if links:
-                        label = strings.msg_link_links if len(links) > 1 else strings.msg_link_single
-                        lines.append(label)
-                        for link in links:
-                            lines.append(f"<code>{telegram_html_escape(link)}</code>")
-                        lines.append("")
-                    else:
-                        lines.append(strings.msg_link_no_links)
-                        lines.append("")
-
-                    lines.extend([
-                        f"{strings.msg_link_place} {place_str}",
-                        f"{strings.msg_link_registered} {date_str}",
-                        f"{strings.msg_link_bonus} {bonus_str}",
-                        "",
-                        strings.msg_link_password_note,
-                    ])
-                    bot.send_message(chat_id, "\n".join(lines))
+                    msg = build_platform_access_message(session, entry, links)
+                    bot.send_message(chat_id, msg)
                     continue
 
                 # Admin: Switch to User menu
@@ -386,6 +428,29 @@ def main():
                     user_states[chat_id] = "awaiting_links"
                     continue
 
+                # Admin: Send platform access message
+                if is_admin and text == strings.msg_admin_broadcast:
+                    skip_keyboard = telegram.ReplyKeyboardMarkup(
+                        [[telegram.KeyboardButton(strings.msg_set_link_skip)]],
+                        one_time_keyboard=True,
+                    )
+                    bot.send_message(
+                        chat_id,
+                        strings.msg_broadcast_prompt,
+                        reply_markup=skip_keyboard,
+                    )
+                    user_states[chat_id] = "awaiting_broadcast_minutes"
+                    continue
+
+                # Admin: Stop recurring broadcast
+                if is_admin and text == strings.msg_admin_stop_broadcast:
+                    if broadcast_state["active"]:
+                        broadcast_state["stop_requested"] = True
+                        bot.send_message(chat_id, strings.msg_broadcast_stopped)
+                    else:
+                        bot.send_message(chat_id, strings.msg_broadcast_not_active)
+                    continue
+
                 # Admin: Delete by username
                 if is_admin and text == strings.msg_admin_delete:
                     cancel_keyboard = telegram.ReplyKeyboardMarkup(
@@ -398,6 +463,73 @@ def main():
                         reply_markup=cancel_keyboard,
                     )
                     user_states[chat_id] = "awaiting_delete_username"
+                    continue
+
+                # Admin: awaiting_broadcast_minutes
+                if is_admin and user_states.get(chat_id) == "awaiting_broadcast_minutes":
+                    if text == strings.msg_delete_cancel:
+                        user_states.pop(chat_id, None)
+                        bot.send_message(
+                            chat_id,
+                            strings.msg_admin_menu,
+                            reply_markup=admin_keyboard,
+                        )
+                        continue
+                    if text == strings.msg_admin_download:
+                        user_states.pop(chat_id, None)
+                        entries = (
+                            session.query(WaitlistEntry)
+                            .order_by(WaitlistEntry.created_at.asc())
+                            .all()
+                        )
+                        lines = [f"{i}. {e.wanted_username} {e.password}" for i, e in enumerate(entries, 1)]
+                        buf = BytesIO("\n".join(lines).encode("utf-8"))
+                        buf.name = "users.txt"
+                        bot.send_document(chat_id, buf, filename="users.txt", caption=strings.msg_file_caption)
+                        bot.send_message(chat_id, strings.msg_admin_menu, reply_markup=admin_keyboard)
+                        continue
+                    if text == strings.msg_set_link_skip:
+                        user_states.pop(chat_id, None)
+                        admin_ids = [a.user_id for a in session.query(Admin).all()]
+                        bot.send_message(chat_id, strings.msg_broadcast_one_time, reply_markup=admin_keyboard)
+
+                        def run_one_time():
+                            do_broadcast(bot, Session, admin_ids)
+
+                        threading.Thread(target=run_one_time, daemon=True).start()
+                        continue
+                    try:
+                        minutes = int(text)
+                        if minutes < 1:
+                            raise ValueError("must be positive")
+                    except ValueError:
+                        bot.send_message(chat_id, strings.msg_broadcast_invalid)
+                        continue
+                    user_states.pop(chat_id, None)
+                    if broadcast_state["active"]:
+                        broadcast_state["stop_requested"] = True
+                        time.sleep(2)
+                    admin_ids = [a.user_id for a in session.query(Admin).all()]
+                    bot.send_message(
+                        chat_id,
+                        strings.msg_broadcast_recurring.format(minutes=minutes),
+                        reply_markup=admin_keyboard,
+                    )
+
+                    def run_recurring():
+                        broadcast_state["stop_requested"] = False
+                        broadcast_state["active"] = True
+                        try:
+                            while not broadcast_state["stop_requested"]:
+                                do_broadcast(bot, Session, admin_ids)
+                                for _ in range(minutes * 60):
+                                    if broadcast_state["stop_requested"]:
+                                        break
+                                    time.sleep(1)
+                        finally:
+                            broadcast_state["active"] = False
+
+                    threading.Thread(target=run_recurring, daemon=True).start()
                     continue
 
                 # Admin: awaiting_delete_username
